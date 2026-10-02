@@ -1,7 +1,7 @@
 """
 Crypto Momentum Analyzer
 =========================
-ดึงข้อมูลราคาเหรียญคริปโตจาก CoinGecko (ฟรี ไม่ต้องใช้ API key)
+ดึงข้อมูลราคาเหรียญคริปโตจาก CoinGecko (ใช้ Demo API key ฟรี แนะนำสำหรับรันบน Render)
 คำนวณอินดิเคเตอร์เชิงเทคนิคจากข้อมูลย้อนหลัง แล้วจัดอันดับเหรียญ
 ที่มี "โมเมนตัมเชิงบวก" มากที่สุด พร้อมสร้างแดชบอร์ด HTML แบบสวยงาม
 
@@ -28,11 +28,13 @@ Crypto Momentum Analyzer
 
 วิธีใช้:
     pip install requests pandas numpy
-    python crypto_analyzer.py
+    export COINGECKO_API_KEY=CG-xxxxxxxx   # (ไม่บังคับในเครื่อง แต่แนะนำบน Render)
+    python crypto_analyzer_pooling.py
 
 ผลลัพธ์: ไฟล์ crypto_dashboard.html ที่เปิดดูในเบราว์เซอร์ได้ทันที
 """
 
+import os
 import time
 import json
 import math
@@ -46,82 +48,126 @@ import numpy as np
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 TOP_N_COINS = 45          # จำนวนเหรียญ (ตาม market cap) ที่จะนำมาวิเคราะห์
-HISTORY_DAYS = 365        # free tier ของ CoinGecko รองรับช่วงนี้แน่นอน (ปรับเพิ่มได้ถ้า API รองรับ)
+HISTORY_DAYS = 365        # free/demo tier ของ CoinGecko รองรับช่วงนี้แน่นอน
 MIN_ROWS_REQUIRED = 220   # ต้องมีข้อมูลอย่างน้อยเท่านี้ถึงจะคำนวณ MA200 ได้
-REQUEST_DELAY = 1.5       # วินาที หน่วงระหว่าง request เพื่อไม่ให้โดน rate limit (free tier)
+REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "2.5"))  # วินาที (~24 req/นาที ต่ำกว่าเพดาน 30/นาที)
 TOP_RESULT = 5
 TARGET_PROFIT_PCT = 5.0   # เป้ากำไร (%) ที่ใช้ประมาณจำนวนวัน ปรับได้ตามต้องการ
 
+CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
+CACHE_TTL_SEC = int(os.environ.get("CACHE_TTL_SEC", str(6 * 3600)))  # ใช้แคชซ้ำได้ 6 ชม.
+
+# Demo API key (ฟรี) จาก https://www.coingecko.com/en/api  -> ตั้งเป็น Environment Variable
+# ชื่อ COINGECKO_API_KEY บน Render. มี key = โควตาผูกกับ key ไม่ใช่ IP ที่แชร์กับคนอื่น
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "").strip()
 HEADERS = {"User-Agent": "Mozilla/5.0 (crypto-momentum-analyzer)"}
+if COINGECKO_API_KEY:
+    HEADERS["x-cg-demo-api-key"] = COINGECKO_API_KEY
 
 
-def get_top_coins(n=TOP_N_COINS):
-    """ดึงรายชื่อเหรียญ top N ตาม market cap"""
-    url = f"{COINGECKO_BASE}/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": n,
-        "page": 1
-    }
+def _cache_path(name):
+    return os.path.join(CACHE_DIR, f"{name}.json")
+
+
+def cache_load(name):
+    path = _cache_path(name)
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=30)
-    except requests.RequestException as e:
-        print(f"  -> get_top_coins: request error {e}")
-        return None
-
-    if r.status_code != 200:
-        print(f"  -> get_top_coins error: status {r.status_code} | {r.text[:150]}")
-        return None
-    return r.json()
+        if time.time() - os.path.getmtime(path) < CACHE_TTL_SEC:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    return None
 
 
-def get_history(coin_id, days=HISTORY_DAYS, retries=3):
-    """ดึงราคา/ปริมาณย้อนหลัง (daily) ของเหรียญหนึ่งตัว
+def cache_save(name, data):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(_cache_path(name), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
 
-    หมายเหตุ: ไม่ส่ง interval=daily อีกต่อไป เพราะ free tier ของ CoinGecko
-    จำกัดพารามิเตอร์นี้ไว้ให้แผนเสียเงินเท่านั้น ปล่อยให้ API auto-select
-    ความละเอียดตามช่วงวันที่ขอแทน (ปกติ >90 วันจะได้ความละเอียดเป็นรายวันอยู่แล้ว)
-    """
-    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
-    params = {"vs_currency": "usd", "days": days}
 
+def http_get_with_retry(url, params, retries=6, label=""):
+    """GET พร้อม retry/backoff. โดน 429 -> เคารพ Retry-After แล้วรอ, ไม่ยอมแพ้ง่าย"""
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=HEADERS, timeout=30)
         except requests.RequestException as e:
-            print(f"  -> {coin_id}: request error {e}, ลองใหม่...")
+            print(f"  -> {label}: request error {e}, ลองใหม่...")
             time.sleep(5)
             continue
 
         if r.status_code == 200:
-            data = r.json()
-            prices = pd.DataFrame(data.get("prices", []), columns=["ts", "price"])
-            volumes = pd.DataFrame(data.get("total_volumes", []), columns=["ts", "volume"])
-
-            if prices.empty:
-                print(f"  -> {coin_id}: status 200 แต่ prices ว่างเปล่า")
-                return None
-
-            df = prices.merge(volumes, on="ts", how="left")
-            # แปลง timestamp (ms) เป็น datetime แล้วตั้งเป็น index ให้เรียงตามเวลา
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-            df = df.set_index("ts").sort_index()
-
-            print(f"  -> {coin_id}: OK ได้ {len(df)} แถว")
-            return df
-
-        elif r.status_code == 429:
-            wait = 10 * (attempt + 1)
-            print(f"  -> {coin_id}: โดน rate limit (429), รอ {wait} วินาที แล้วลองใหม่...")
+            return r
+        if r.status_code in (429, 500, 502, 503, 504):
+            try:
+                wait = int(r.headers.get("Retry-After", ""))
+            except ValueError:
+                wait = min(20 * (attempt + 1), 90)
+            print(f"  -> {label}: status {r.status_code}, รอ {wait}s (ครั้งที่ {attempt+1}/{retries})")
             time.sleep(wait)
-
-        else:
-            print(f"  -> {coin_id}: error status {r.status_code} | {r.text[:150]}")
-            return None
-
-    print(f"  -> {coin_id}: ลองครบ {retries} ครั้งแล้วยังไม่สำเร็จ")
+            continue
+        print(f"  -> {label}: error status {r.status_code} | {r.text[:150]}")
+        return None
+    print(f"  -> {label}: ลองครบ {retries} ครั้งแล้วยังไม่สำเร็จ")
     return None
+
+
+def get_top_coins(n=TOP_N_COINS):
+    """ดึงรายชื่อเหรียญ top N ตาม market cap (มี cache + retry)"""
+    cached = cache_load(f"top_{n}")
+    if cached:
+        print("  -> get_top_coins: ใช้ข้อมูลจากแคช")
+        return cached
+    r = http_get_with_retry(
+        f"{COINGECKO_BASE}/coins/markets",
+        {"vs_currency": "usd", "order": "market_cap_desc", "per_page": n, "page": 1},
+        label="get_top_coins",
+    )
+    if not r:
+        return None
+    data = r.json()
+    cache_save(f"top_{n}", data)
+    return data
+
+
+def get_history(coin_id, days=HISTORY_DAYS, retries=6):
+    """ดึงราคา/ปริมาณย้อนหลัง (daily) ของเหรียญหนึ่งตัว (มี cache + retry)
+
+    หมายเหตุ: ไม่ส่ง interval=daily เพราะเป็นฟีเจอร์แผนเสียเงิน ปล่อยให้ API
+    auto-select ความละเอียดตามช่วงวัน (>90 วัน = รายวัน)
+    """
+    data = cache_load(f"hist_{coin_id}_{days}")
+    from_cache = data is not None
+    if data is None:
+        r = http_get_with_retry(
+            f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
+            {"vs_currency": "usd", "days": days},
+            retries=retries,
+            label=coin_id,
+        )
+        if not r:
+            return None
+        data = r.json()
+        cache_save(f"hist_{coin_id}_{days}", data)
+
+    prices = pd.DataFrame(data.get("prices", []), columns=["ts", "price"])
+    volumes = pd.DataFrame(data.get("total_volumes", []), columns=["ts", "volume"])
+    if prices.empty:
+        print(f"  -> {coin_id}: status 200 แต่ prices ว่างเปล่า")
+        return None
+
+    df = prices.merge(volumes, on="ts", how="left")
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+    df = df.set_index("ts").sort_index()
+    print(f"  -> {coin_id}: OK ได้ {len(df)} แถว" + (" (แคช)" if from_cache else ""))
+    get_history.last_from_cache = from_cache
+    return df
+
+
+get_history.last_from_cache = False
 
 
 def rsi(series, period=14):
@@ -445,12 +491,15 @@ def main():
         watch_price(args.watch, interval=args.interval)
         return
 
+    if not COINGECKO_API_KEY:
+        print("⚠️ ไม่พบ COINGECKO_API_KEY (ใช้โหมดไม่มี key) บน Render มักโดน 429 "
+              "แนะนำให้ตั้ง Demo API key ฟรีเป็น Environment Variable")
     print("กำลังดึงรายชื่อเหรียญ top", TOP_N_COINS, "...")
     coins = get_top_coins(TOP_N_COINS)
 
     if not coins:
         print("ดึงรายชื่อเหรียญไม่สำเร็จ (ดู error ด้านบน)")
-        return
+        sys.exit(1)
 
     results = []
     for i, c in enumerate(coins):
@@ -461,12 +510,13 @@ def main():
             res = analyze_coin(coin_id, c["symbol"], c["name"], df)
             if res:
                 results.append(res)
-        time.sleep(REQUEST_DELAY)  # กัน rate limit ของ CoinGecko free tier
+        if not get_history.last_from_cache:
+            time.sleep(REQUEST_DELAY)  # กัน rate limit ของ CoinGecko
 
     if not results:
         print("\nไม่พบข้อมูลเพียงพอสำหรับการวิเคราะห์")
         print("ดูบรรทัด '-> ... ข้ามเพราะมีข้อมูลแค่ ... แถว' ด้านบนเพื่อหาสาเหตุ")
-        return
+        sys.exit(1)
 
     results.sort(key=lambda x: x["score"], reverse=True)
 
