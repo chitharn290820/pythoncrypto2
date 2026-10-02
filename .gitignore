@@ -1,0 +1,5 @@
+__pycache__/
+cache/
+crypto_dashboard.html
+crypto_analysis_full.json
+.env
